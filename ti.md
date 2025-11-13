@@ -73,4 +73,165 @@ export const createLimitedRunner = (tasks, { limit, windowMs }) => {
 };
 ```
 
+### Возможное решение
+
+```js
+export const createLimitedRunner = (tasks, { limit, windowMs }) => {
+  if (!Array.isArray(tasks)) throw new TypeError('tasks must be an array');
+  if (!Number.isFinite(limit) || limit <= 0) throw new RangeError('limit must be > 0');
+  if (!Number.isFinite(windowMs) || windowMs <= 0) throw new RangeError('windowMs must be > 0');
+
+  let started = false;
+  let done = false;
+  let cancelled = false;
+  let resolveMain;
+  let rejectMain;
+
+  const total = tasks.length;
+  const results = new Array(total);
+  const history = [];
+
+  let nextIndex = 0;
+  let active = 0;
+  let settled = 0;
+  let firstError;
+
+  const trimHistory = (now) => {
+    while (history.length && now - history[0] >= windowMs) {
+      history.shift();
+    }
+  };
+
+  const waitForWindow = () => {
+    if (cancelled || done) return Promise.resolve();
+    return new Promise((resolve) => {
+      const attempt = () => {
+        if (cancelled || done) {
+          resolve();
+          return;
+        }
+        const now = Date.now();
+        trimHistory(now);
+        if (history.length < limit) {
+          resolve();
+          return;
+        }
+        const delay = Math.max(0, history[0] + windowMs - now);
+        setTimeout(attempt, delay);
+      };
+      attempt();
+    });
+  };
+
+  const finalize = (applyResult) => {
+    const gate = (!cancelled && !done)
+      ? waitForWindow().then(() => {
+          if (!cancelled && !done) {
+            const now = Date.now();
+            trimHistory(now);
+            history.push(now);
+          }
+        })
+      : Promise.resolve();
+
+    gate
+      .then(() => {
+        if (!cancelled && !done && typeof applyResult === 'function') {
+          applyResult();
+        }
+      })
+      .finally(() => {
+        settled += 1;
+        maybeComplete();
+      });
+  };
+
+  const maybeComplete = () => {
+    if (!started || done || cancelled) return;
+    if (firstError) {
+      if (active === 0) {
+        done = true;
+        rejectMain(firstError);
+      }
+      return;
+    }
+    if (settled === total && active === 0 && nextIndex >= total) {
+      done = true;
+      resolveMain(results);
+    }
+  };
+
+  function handleSuccess(index, value) {
+    active -= 1;
+    pump();
+    finalize(() => {
+      results[index] = value;
+    });
+  }
+
+  function handleFailure(error) {
+    active -= 1;
+    if (!firstError) {
+      firstError = error;
+    }
+    pump();
+    finalize();
+  }
+
+  function startTask(index) {
+    active += 1;
+    Promise.resolve()
+      .then(() => tasks[index]())
+      .then(
+        (value) => handleSuccess(index, value),
+        (error) => handleFailure(error),
+      );
+  }
+
+  function pump() {
+    if (!started || done || cancelled || firstError) return;
+    while (active < limit && nextIndex < total) {
+      startTask(nextIndex++);
+    }
+  }
+
+  const execute = () => {
+    if (started) throw new Error('execute() already called');
+    if (cancelled) throw new Error('Runner already cancelled');
+
+    const invalidIndex = tasks.findIndex((task) => typeof task !== 'function');
+    if (invalidIndex !== -1) {
+      throw new TypeError(`Task at index ${invalidIndex} must be a function`);
+    }
+
+    started = true;
+    if (total === 0) {
+      done = true;
+      return Promise.resolve([]);
+    }
+
+    const controller = new Promise((resolve, reject) => {
+      resolveMain = resolve;
+      rejectMain = reject;
+    });
+
+    pump();
+    return controller;
+  };
+
+  const cancel = () => {
+    if (cancelled || done || firstError) return;
+    cancelled = true;
+    if (!started) {
+      done = true;
+      return;
+    }
+    done = true;
+    rejectMain(new Error('Cancelled'));
+  };
+
+  return { execute, cancel };
+};
+```
+
 Интервью длится 45–60 минут. Требования можно подстраивать под уровень кандидата.
